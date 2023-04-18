@@ -1,0 +1,451 @@
+---
+title: "MIRT"
+author: "Jingruo Sun"
+date: "3/6/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We try methods of MCEM and MHRM by applying the MIRT package in R in order to do the confirmatory item analysis. 
+
+PART I code
+
+```{r}
+# Import necessary packages
+# install.packages("torch")
+# install.packages("rTorch")
+library(rTorch)
+library(torch)
+library(matrixStats)
+library(ggplot2)
+
+sigmoid <- function(x) {
+return (1 / (1 + exp(-x) + 1e-8))
+}
+
+is_pos_def <- function(x) {
+return (all(eigen(x)$values > 0))
+}
+
+create_factor_cov <- function(correlated, K, seed=1) {
+  set.seed(seed)
+  if (correlated) {
+    while (TRUE) {
+      factor_cov_mat <- matrix(runif(K*K), ncol=K)
+      factor_cov_mat <- 0.5 * (factor_cov_mat + t(factor_cov_mat))
+      diag(factor_cov_mat) <- 1
+      if (is.positive.definite(factor_cov_mat)) {
+        break
+      }
+    }
+  } 
+  else {
+    factor_cov_mat <- diag(K)
+  }
+  return(factor_cov_mat)
+}
+```
+PART II code
+
+```{r}
+MirtDataset <- function(n, j, k, pl, seed=1, ...) {
+  
+  library(torch)
+  library(rTorch)
+  
+  # set the seed for generating random numbers
+  set.seed(seed)
+  torch.manual_seed(seed)
+  torch.cuda.manual_seed_all(seed)
+  
+  # to only use convolution algorithms and select the fastest
+  torch.backends.cudnn.deterministic(TRUE)
+  torch.backends.cudnn.benchmark(FALSE)
+  
+  device <- if ("device" %in% names(list(...))) ...$device else "cpu"
+  
+  # set up model parameters
+  X <- generate_x(n, k, ...)
+  a <- generate_a(j, k, ...)
+  b <- generate_b(j, ...)
+  cd <- generate_cd(j, pl, ...)
+  c <- cd[1]
+  d <- cd[2]
+  
+  # obtain the predicted y value and observed y value
+  link <- if ("link" %in% names(list(...))) ...$link else sigmoid
+  logit <- b + t(X) %*% a
+  prob <- c + (d - c) * link(logit)
+  Y_full <- rbinom(n, 1, prob)
+  Y_observed_indi <- generate_y_observed_mask(n, j, ...)
+  Y <- matrix(NA_real_, nrow = n, ncol = j)
+  Y[Y_observed_indi] <- Y_full[Y_observed_indi]
+  
+  list(X = torch::from_numpy(X) %>% torch::to(device),
+       a = torch::from_numpy(a) %>% torch::to(device),
+       b = torch::from_numpy(b) %>% torch::to(device),
+       c = torch::from_numpy(c) %>% torch::to(device),
+       d = torch::from_numpy(d) %>% torch::to(device),
+       Y_full = torch::from_numpy(Y_full) %>% torch::to(device),
+       Y = torch::from_numpy(Y) %>% torch::float() %>% torch::to(device))
+}
+
+# get the length of data
+length.MirtDataset <- function(x) nrow(x$Y)
+
+# get the "item"-th value
+`[.MirtDataset` <- function(x, i, j) {
+  x$Y[i, j]
+}
+
+generate_x <- function(n, k, ...) {
+  # "kwarg.get" extracts the value corresponding to the key (first argument in the function);
+  # if the key is not in the dictionary, it will return the
+  # second argument passed in the function
+  factor_cov_mat <- if ("factor_cov_mat" %in% names(list(...))) ...$factor_cov_mat else diag(k)
+  MASS::mvrnorm(n, mu = rep(0, k), Sigma = factor_cov_mat)
+}
+
+generate_a <- function(j, k, ...) {
+  dist <- if ("a_dist" %in% names(list(...))) ...$a_dist else "uniform"
+  shape <- if ("a_shape" %in% names(list(...))) ...$a_shape else "diag"
+  factor_influ <- if ("factor_influ" %in% names(list(...))) ...$factor_influ else 1
+  item_depend <- if ("item_depend" %in% names(list(...))) ...$item_depend else 1
+  
+  stopifnot(shape %in% c("diag", "s", "upper", "lower"))
+  stopifnot(factor_influ > 0)
+  stopifnot(item_depend > 0)
+  
+  if (shape %in% c("upper", "lower")) {
+    if (dist == "uniform") {
+      a <- matrix(runif(n = j * k, min = 0.5, max = 1.5), nrow = j, ncol = k)
+    } else {
+      a <- matrix(rlnorm(n = j * k), nrow = j, ncol = k)
+    }
+    if (shape == "upper") {
+      a <- upper.tri(a)    # function for creating an upper triangle matrix
+    } else {
+      a <- lower.tri(a)    # function for creating a lower triange matrix
+    }
+    return(a)
+  }
+  
+  rep_j <- (k - item_depend + 1) * factor_influ
+  rep_block <- ceiling(j / rep_j)
+
+  if (dist == "uniform") {
+    a_block_full <- matrix(runif(n = rep_j * k, min = 0.5, max = 1.5), nrow = rep_j, ncol = k)
+  } else {
+    a_block_full <- matrix(rlnorm(n = rep_j * k), nrow = rep_j, ncol = k)
+  }
+
+  a_block <- matrix(0, nrow = rep_j, ncol = k)
+  for (col in 1:k) {
+    if ((col + item_depend - 1) > k) {
+      break    # find the number of pivots
+    }
+    row <- (col - 1) * factor_influ + 1
+    a_block[row:(row + factor_influ - 1), col:(col + item_depend - 1)] <- 
+      a_block_full[row:(row + factor_influ - 1), col:(col + item_depend - 1)]
+  }
+  
+  ext_a <- list()
+  for (i in 1:rep_block) {
+    ext_a[[i]] <- a_block
+    if (shape == "s") {
+      a_block <- a_block[nrow(a_block):1, ]
+    }
+  }
+  ext_a <- do.call(rbind, ext_a)    # combine the values collected in the set as a matrix
+  return(ext_a[1:j, ])
+}
+
+generate_b <- function(j, with_b=TRUE) {
+  if(with_b) {
+    return(rnorm(j))
+  } else {
+    return(rep(0, j))
+  }
+}
+
+generate_cd <- function(j, pl, constant_cd=FALSE) {
+  if(constant_cd) {
+    # A simple version of c = 0.1 and d = 0.9
+    c <- ifelse(pl > 2, rep(0.1, j), rep(0, j))
+    d <- ifelse(pl > 3, rep(0.9, j), rep(1, j))
+  } else {
+    c <- ifelse(pl > 2, rbeta(j, 1, 9), rep(0, j))
+    if(pl > 3) {
+      d <- rep(0, j)
+      # d must be as large as c
+      while(min(d - c) < 0) {
+        d <- rbeta(j, 9, 1)
+      }
+    } else {
+      d <- rep(1, j)
+    }
+  }
+  return(list(c, d))
+}
+
+generate_y_observed_mask <- function(n, j, max_observed = j, shuffle_before_mask = FALSE) {
+  block_columns <- j %/% max_observed
+  block_rows <- n %/% block_columns
+  mask <- matrix(0, n, j)
+  for (diag in seq(block_columns)) {
+    mask[(diag * block_rows - block_rows + 1):(diag * block_rows),          (diag * max_observed - max_observed + 1):(diag * max_observed)] <- 1
+  }
+  if (shuffle_before_mask) {
+    rows <- sample(n)
+    mask <- mask[rows,]
+  }
+  return(mask == 1)
+}
+
+plot_a <- function(figsize=10) {
+  j <- dim(a)[1]
+  k <- dim(a)[2]
+  fig <- plt::figure(figsize=c(figsize, 5 * figsize))
+  ax <- fig$add_subplot(111)
+  a <- torch::as_array(self$a)
+  caxes <- ax$matshow(a, cmap=plt::cm$Blues, interpolation="none")
+  fig$colorbar(caxes)
+
+  ax$set_xticks(np.arange(1, k + 1))
+  ax$set_xticklabels(1:k)
+  ax$tick_params(axis="x", bottom=TRUE, top=FALSE, labelbottom=TRUE, labeltop=FALSE)
+
+  ax$set_yticks(np.arange(1, j + 1))
+  ax$set_yticklabels(1:j)
+  ax$tick_params(axis="y", bottom=TRUE, top=FALSE, labelbottom=TRUE, labeltop=FALSE)
+
+  plt$xlabel("Latent factors")
+  plt$ylabel("Items")
+}
+
+load_data <- function(n, j, k, pl, link=sigmoid, with_b=TRUE, seed=1,
+              a_dist="uniform", a_shape="s", factor_influ=5, item_depend=1,
+              max_observed=NULL, correlated_factor=FALSE,
+              svd_init=FALSE) {
+  
+  seed <- as.integer(seed)
+  J <- as.integer(j)
+  K <- as.integer(k)
+  n <- as.integer(n)
+  pl <- as.integer(pl)
+
+  factor_influ <- as.integer(factor_influ)
+  a_dist <- as.character(a_dist)
+  a_shape <- as.character(a_shape)
+  item_depend <- as.integer(item_depend)
+
+  if (is.null(max_observed)) {
+    max_observed <- J
+  }
+  max_observed <- as.integer(max_observed)
+
+  svd_init <- as.logical(svd_init)
+
+  factor_cov_mat <- create_factor_cov(correlated_factor, K, seed)
+  data <- MirtDataset(n, J, K, pl, link=link, with_b=with_b, seed=seed,
+                       factor_cov_mat=factor_cov_mat,
+                       a_dist=a_dist, a_shape=a_shape,
+                       factor_influ=factor_influ,
+                       item_depend=item_depend,
+                       max_observed=max_observed)
+
+  Y <- as.matrix(data$Y)
+  X <- as.matrix(data$X)
+  a <- as.matrix(data$a)
+  b <- as.matrix(data$b)
+  c <- as.matrix(data$c)
+  d <- as.matrix(data$d)
+
+  if (svd_init) {
+    stop("Due to module import issue, SVD initialization is not supported.")
+  }
+  
+  return(list(Y=Y, X=X, a=a, b=b, c=c, d=d))
+}
+```
+
+The above code describes how to generate data, then we apply the mirt package to to do between and within item CFA.
+
+```{r}
+library("mirt")
+library("knitr")
+
+get_a <- function(j, k) {
+  a_1 = generate_a(j = 45, k = 45)
+  l <- list()
+  for (i in 1:j) {
+    l[i] <- a_1[i, i]
+  }
+  nrow = j/k
+  ncol = k
+  # create an empty matrix of size 15 x 3
+  matrix_3by3 <- matrix(0, nrow, ncol)
+
+  # assign the first 15 numbers to the first column of the matrix
+  matrix_3by3[1:nrow, 1] <- l[1:nrow]
+
+  # create another empty matrix of size 15 x 3
+  matrix_3by3_2 <- matrix(0, j/k, k)
+
+  # assign the second 15 numbers to the second column of the matrix
+  matrix_3by3_2[1:nrow, 2] <- l[(1+nrow):(2*nrow)]
+
+  # create a third empty matrix of size 15 x 3
+  matrix_3by3_3 <- matrix(0, j/k, k)
+
+  # assign the last 15 numbers to the third column of the matrix
+  matrix_3by3_3[1:nrow, 3] <- l[(2*nrow+1):(3*nrow)]
+
+  # bind the three matrices together to create the final 45 x 3 matrix
+  final_matrix <- cbind(matrix_3by3, matrix_3by3_2, matrix_3by3_3)
+  # a = as.numeric(final_matrix)
+  # a = final_matrix
+  final <- matrix(unlist(final_matrix), ncol = 3, byrow = FALSE)
+  return(final)
+}
+a = get_a(j=45, k=3)
+a
+
+get_b <- function(j){
+  b_1 = generate_b(j=45)
+  l <- list()
+  for (i in 1:j) {
+    l[i] <- b_1[i]
+  }
+  # b = as.numeric(cbind(l))
+  b <- matrix(unlist(l), ncol = 1, byrow = FALSE)
+  return(b)
+}
+b = get_b(j=45)
+b
+
+c_1 <- rep(1.0000000, 45)
+c <- matrix(unlist(c_1), ncol = 1, byrow = FALSE)
+
+get_mse_1 <- function() {
+  trimodel <- 'F1 = 1-15
+    F2 = 15-30
+    F3 = 30-45
+    COV = F1*F2*F3'
+  mse = c(1:100)
+  for (i in 1:45) {
+    dataset <- simdata(a, b, 500, itemtype='3PL')
+    trimirt <- mirt(data = dataset, model = trimodel)
+    result = coef(trimirt, IRTpars = FALSE, simplify = TRUE, as.matrix = TRUE)
+    b_1 = result$items[, 2]
+    mse[i] = sum((a[1]-b_1)^2)
+  }
+  return(mse)
+}
+
+get_mse_2 <- function() {
+  trimodel <- 'F1 = 1-15
+    F2 = 15-30
+    F3 = 30-45
+    COV = F1*F2*F3'
+  mse = c(1:100)
+  for (i in 1:45) {
+    dataset <- simdata(a, b, 2000, itemtype='2PL')
+    trimirt <- mirt(data = dataset, model = trimodel)
+    result = coef(trimirt, IRTpars = FALSE, simplify = TRUE, as.matrix = TRUE)
+    a_1 = result$items[, 1]
+    mse[i] = sum((a[1]-a_1)^2)
+  }
+  return(mse)
+}
+
+get_mse_1()
+```
+
+PART III code
+
+```{r}
+# install.packages("ltm")
+library("ltm")
+
+get_mse_1 <- function() {
+  trimodel <- 'F1 = 1-15
+    F2 = 15-30
+    F3 = 30-45
+    COV = F1*F2*F3'
+  mse = c(1:100)
+  for (i in 1:100) {
+    dataset <- simdata(a, b, 100, itemtype='2PL')
+    trimirt <- mirt(data = dataset, model = trimodel)
+    result = coef(trimirt, IRTpars = FALSE, simplify = TRUE, as.matrix = TRUE)
+    a_1 = result$items[, 1]
+    mse[i] = sum((a[1]-a_1)^2)
+  }
+  return(mse)
+}
+
+get_mse_1()
+
+t1 <- system.time(get_mse_1())
+print(t1["elapsed"])
+```
+
+```{r}
+a = c(1,100)
+b = c(0,1)
+mse = c(1:100)
+print("sadsadas")
+```
+PART IV code
+
+```{r}
+matrix_square_sum <- function(a_row, a_col, m1, m2) {
+  s <- 0
+  for (i in 1:a_row) {
+    for (j in 1:a_col) {
+      s <- s + (m1[i, j] - m2[i, j])^2
+    }
+  }
+  return(s)
+}
+
+array_square_sum <- function(b_len, m1, m2) {
+  s <- 0
+  for (i in 1:45) {
+    s <- s + (m1[i] - m2[i])^2
+  }
+  return(s)
+}
+
+calc_rmse_a <- function() {
+  s <- 0
+  for (i in 1:10) {
+    s <- s + matrix_square_sum(45, 3, list_a[[i]], real_a)
+  }
+  s <- s / 10
+  s <- sqrt(s)
+  return(s)
+}
+
+calc_rmse_b <- function() {
+  s <- 0
+  for (i in 1:10) {
+    s <- s + array_square_sum(45, list_b[[i]], real_b)
+  }
+  s <- s / 10
+  s <- sqrt(s)
+  return(s)
+}
+
+real_a = a
+real_b = b
+
+```
+
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
